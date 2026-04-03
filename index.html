@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Block Stack</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#000; overflow:hidden; }
+  #gc { display:block; width:100vw; height:100vh; cursor:crosshair; }
+</style>
+</head>
+<body>
+<canvas id="gc"></canvas>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+<script>
+const { Engine, Runner, Bodies, Body, World } = Matter;
+const canvas = document.getElementById('gc');
+const ctx = canvas.getContext('2d');
+let W, H;
+function resize() { W = canvas.width = window.innerWidth; H = canvas.height = window.innerHeight; }
+resize();
+window.addEventListener('resize', resize);
+
+const COLORS = ['#ff5f5f','#ff9d3a','#ffd93d','#6bcf7f','#4fc3f7','#ab7df8','#f06292','#4dd0e1'];
+const SHAPES = [[80,40],[40,40],[120,40]];const DEATH_BELOW = 160;
+const SPAWN_ABOVE = 220;
+const ROT_INIT  = 0.012;
+const ROT_ACCEL = 0.00018;
+const ROT_MAX   = 0.22;
+const SETTLE_V  = 0.5;
+const SETTLE_AV = 0.04;
+const SETTLE_WAIT = 50;
+
+let game = null;
+
+class Game {
+  constructor(prevBest) {
+    // Engine.create 에 positionIterations/velocityIterations 넣으면 오류남 - 따로 설정
+    this.engine = Engine.create();
+    this.engine.gravity.y = 1.8;
+    this.engine.positionIterations = 10;
+    this.engine.velocityIterations = 10;
+    this.runner = Runner.create();
+    Runner.run(this.runner, this.engine);
+
+    this.blocks = [];
+    this.cur = null;
+    this.score = 0;
+    this.best = prevBest || 0;
+    this.state = 'playing';
+    this.platY = H * 0.78;
+    this.platW = W * 0.28;
+    this.platH = 16;
+    this.stackTopWorld = this.platY - this.platH / 2;
+    this.canDrop = true;
+    this.settling = false;
+    this.settleCnt = 0;
+    this.rotDir = 1;
+    this.rotSpeed = ROT_INIT;
+    this.rotFrame = 0;
+
+    this._makePlatform();
+    this._spawn();
+
+    // 초기 카메라: 스폰된 블록 기준으로 설정
+    const initX = this._stackTop() - H * 0.25;
+    this.camY = initX > 0 ? 0 : initX;
+  }
+
+  _makePlatform() {
+    const p  = Bodies.rectangle(W/2, this.platY, this.platW, this.platH, { isStatic:true, friction:0.9, restitution:0.02, label:'plat' });
+    const wL = Bodies.rectangle(-25, H/2, 50, H*4, { isStatic:true, label:'wall' });
+    const wR = Bodies.rectangle(W+25, H/2, 50, H*4, { isStatic:true, label:'wall' });
+    World.add(this.engine.world, [p, wL, wR]);
+  }
+
+  _spawn() {
+    const [bw, bh] = SHAPES[Math.floor(Math.random() * SHAPES.length)];
+    const sw = bw * (W / 600);
+    const sh = bh * (W / 600);
+    const col = COLORS[Math.floor(Math.random() * COLORS.length)];
+    const spawnY = this.stackTopWorld - SPAWN_ABOVE;
+
+    const b = Bodies.rectangle(W/2, spawnY, sw, sh, {
+      isStatic: true,
+      friction: 0.75, restitution: 0.04, frictionAir: 0.01,
+      angle: Math.random() * Math.PI * 2,
+      label: 'block'
+    });
+    World.add(this.engine.world, b);
+
+    const bd = { body:b, color:col, w:sw, h:sh };
+    this.blocks.push(bd);
+    this.cur = bd;
+    this.rotDir   = Math.random() > 0.5 ? 1 : -1;
+    this.rotSpeed = ROT_INIT;
+    this.rotFrame = 0;
+    this.canDrop  = true;
+    this.settling = false;
+    this.settleCnt = 0;
+
+    // 스폰 즉시 카메라 텔레포트
+    const cx = spawnY - H * 0.25;
+    this.camY = cx > 0 ? 0 : cx;
+  }
+
+  drop() {
+    if (!this.canDrop || !this.cur || this.state !== 'playing') return;
+    const b   = this.cur.body;
+    const pos = { x: b.position.x, y: b.position.y };
+    const ang = b.angle;
+    const bd  = this.cur;
+    World.remove(this.engine.world, b);
+    this.blocks.pop();
+
+    const nb = Bodies.rectangle(pos.x, pos.y, bd.w, bd.h, {
+      isStatic: false,
+      friction: 0.75, restitution: 0.04, frictionAir: 0.008,
+      angle: ang, label: 'block', density: 0.002
+    });
+    World.add(this.engine.world, nb);
+    this.blocks.push({ body:nb, color:bd.color, w:bd.w, h:bd.h });
+
+    this.cur      = null;
+    this.canDrop  = false;
+    this.settling = true;
+    this.settleCnt = 0;
+  }
+
+  // 회전 중인 블록은 중심 Y, 나머지는 꼭짓점 Y 사용
+  _stackTop() {
+    let top = this.platY - this.platH / 2;
+    for (const bd of this.blocks) {
+      if (bd === this.cur) {
+        // 회전 블록: 중심 Y
+        if (bd.body.position.y < top) top = bd.body.position.y;
+      } else {
+        // 쌓인 블록: 꼭짓점 Y
+        for (const v of bd.body.vertices) {
+          if (v.y < top) top = v.y;
+        }
+      }
+    }
+    return top;
+  }
+
+  _settled() {
+    for (const bd of this.blocks) {
+      if (bd === this.cur) continue;
+      if (bd.body.isStatic) continue;
+      if (bd.body.speed > SETTLE_V || Math.abs(bd.body.angularSpeed) > SETTLE_AV) return false;
+    }
+    return true;
+  }
+
+  _dead() {
+    const limit = this.platY + DEATH_BELOW; // 월드 좌표 고정
+    for (const bd of this.blocks) {
+      if (bd === this.cur) continue;
+      if (bd.body.isStatic) continue;
+      if (bd.body.position.y > limit) return true;
+    }
+    return false;
+  }
+
+  update() {
+    if (this.state !== 'playing') return;
+
+    // 회전 (기다릴수록 가속, 방향만 랜덤)
+    if (this.cur) {
+      this.rotFrame++;
+      this.rotSpeed = Math.min(ROT_MAX, ROT_INIT + ROT_ACCEL * this.rotFrame);
+      Body.setAngle(this.cur.body, this.cur.body.angle + this.rotSpeed * this.rotDir);
+    }
+
+    // 정착 처리
+    if (this.settling) {
+      if (this._dead()) { this.state = 'dead'; return; }
+      if (this._settled()) {
+        this.settleCnt++;
+        if (this.settleCnt >= SETTLE_WAIT) {
+          this.stackTopWorld = this._stackTop();
+          const h = (this.platY - this.platH / 2) - this.stackTopWorld;
+          this.score = parseFloat((h / 30).toFixed(1));
+          if (this.score > this.best) this.best = this.score;
+          this.settling = false;
+          this._spawn();
+        }
+      } else {
+        this.settleCnt = 0;
+      }
+    }
+
+    // 카메라: 회전 블록 중심 포함한 최고점 기준
+    // ctx.translate(0, -camY) 이므로 camY 클수록 위로 스크롤
+    // x = top - H*0.25 이면 if x > 0 then x else 0
+    const top = this._stackTop();
+    const x = top - H * 0.25;
+    const targetCamY = x > 0 ? 0 : x;
+    this.camY += (targetCamY - this.camY) * 0.07;
+  }
+
+  draw() {
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = '#080810';
+    ctx.fillRect(0, 0, W, H);
+
+    // 카메라 적용 (월드 좌표 → 화면 좌표)
+    ctx.save();
+    ctx.translate(0, -this.camY);
+
+    // 그리드
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255,255,255,0.025)';
+    ctx.lineWidth = 0.5;
+    const gs = 50;
+    const oy = ((this.camY % gs) + gs) % gs;
+    for (let y = this.camY - oy; y < this.camY + H; y += gs) {
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    }
+    for (let x = 0; x < W; x += gs) {
+      ctx.beginPath(); ctx.moveTo(x, this.camY); ctx.lineTo(x, this.camY + H); ctx.stroke();
+    }
+    ctx.restore();
+
+    // 사망선 (월드 좌표)
+    const deadY = this.platY + DEATH_BELOW;
+    ctx.save();
+    ctx.globalAlpha = 0.1; ctx.fillStyle = '#ff3333';
+    ctx.fillRect(0, deadY, W, H * 4);
+    ctx.globalAlpha = 0.5; ctx.strokeStyle = '#ff4444';
+    ctx.lineWidth = 1; ctx.setLineDash([8, 6]);
+    ctx.beginPath(); ctx.moveTo(0, deadY); ctx.lineTo(W, deadY); ctx.stroke();
+    ctx.restore();
+
+    // 플랫폼 (월드 좌표)
+    ctx.save();
+    ctx.fillStyle = '#22223a'; ctx.strokeStyle = '#5566aa'; ctx.lineWidth = 1.5;
+    ctx.fillRect(W/2 - this.platW/2, this.platY - this.platH/2, this.platW, this.platH);
+    ctx.strokeRect(W/2 - this.platW/2, this.platY - this.platH/2, this.platW, this.platH);
+    ctx.restore();
+
+    // 블록 (월드 좌표)
+    for (const bd of this.blocks) {
+      const b = bd.body;
+      ctx.save();
+      ctx.translate(b.position.x, b.position.y);
+      ctx.rotate(b.angle);
+      ctx.fillStyle  = bd === this.cur ? bd.color + 'aa' : bd.color;
+      ctx.strokeStyle = bd.color;
+      ctx.lineWidth  = 1.5;
+      ctx.fillRect(-bd.w/2, -bd.h/2, bd.w, bd.h);
+      ctx.strokeRect(-bd.w/2, -bd.h/2, bd.w, bd.h);
+      ctx.fillStyle = 'rgba(255,255,255,0.13)';
+      ctx.fillRect(-bd.w/2, -bd.h/2, bd.w, bd.h * 0.38);
+      ctx.restore();
+    }
+
+    // 가이드선 (월드 좌표)
+    if (this.cur) {
+      const b = this.cur.body;
+      ctx.save();
+      ctx.strokeStyle = this.cur.color + '40';
+      ctx.lineWidth = 1; ctx.setLineDash([3, 5]);
+      ctx.beginPath();
+      ctx.moveTo(b.position.x, b.position.y);
+      ctx.lineTo(b.position.x, deadY);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    ctx.restore(); // 카메라 해제 - 이 아래는 화면 좌표
+
+    // 속도 게이지 (화면 좌표)
+    if (this.cur) {
+      const ratio = (this.rotSpeed - ROT_INIT) / (ROT_MAX - ROT_INIT);
+      const gw = W * 0.18, gx = W/2 - gw/2, gy = H - 36;
+      ctx.fillStyle = 'rgba(255,255,255,0.07)';
+      ctx.fillRect(gx, gy, gw, 5);
+      const r = Math.round(255 * Math.min(1, ratio * 2));
+      const g = Math.round(255 * Math.min(1, (1 - ratio) * 2));
+      ctx.fillStyle = `rgb(${r},${g},60)`;
+      ctx.fillRect(gx, gy, gw * ratio, 5);
+    }
+
+    // HUD (화면 좌표)
+    const fs = Math.max(14, W * 0.022);
+    ctx.textAlign = 'left';
+    ctx.font = `bold ${fs * 2.2}px monospace`;
+    ctx.fillStyle = '#fff';
+    ctx.fillText(this.score.toFixed(1), 24, 62);
+    ctx.font = `${fs * 0.85}px monospace`;
+    ctx.fillStyle = '#445';
+    ctx.fillText('BEST ' + this.best.toFixed(1), 26, 62 + fs * 1.7);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#333';
+    ctx.font = `${fs * 0.75}px monospace`;
+    ctx.fillText('[W/SPACE] DROP  [R] RESET', W - 18, H - 16);
+
+    if (this.settling) {
+      ctx.font = `${fs}px monospace`;
+      ctx.fillStyle = '#ff9d3a77';
+      ctx.textAlign = 'center';
+      ctx.fillText('• • •', W/2, 42);
+    }
+
+    if (this.state === 'dead') {
+      ctx.fillStyle = 'rgba(8,8,16,0.82)';
+      ctx.fillRect(0, 0, W, H);
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#ff5f5f';
+      ctx.font = `bold ${Math.max(30, W * 0.06)}px monospace`;
+      ctx.fillText('GAME OVER', W/2, H/2 - 28);
+      ctx.fillStyle = '#777';
+      ctx.font = `${fs * 1.1}px monospace`;
+      ctx.fillText(`SCORE ${this.score.toFixed(1)}   BEST ${this.best.toFixed(1)}`, W/2, H/2 + 18);
+      ctx.fillStyle = '#444';
+      ctx.font = `${fs}px monospace`;
+      ctx.fillText('[R] 다시 시작', W/2, H/2 + 54);
+    }
+  }
+}
+
+function startGame() {
+  const pb = game ? game.best : 0;
+  if (game) { Runner.stop(game.runner); Engine.clear(game.engine); }
+  game = new Game(pb);
+}
+
+document.addEventListener('keydown', e => {
+  if (e.code === 'KeyR') { e.preventDefault(); startGame(); }
+  if (e.code === 'KeyW' || e.code === 'Space') { e.preventDefault(); game && game.drop(); }
+});
+canvas.addEventListener('click', () => game && game.drop());
+
+(function loop() {
+  requestAnimationFrame(loop);
+  if (game) { game.update(); game.draw(); }
+})();
+
+startGame();
+</script>
+</body>
+</html>
